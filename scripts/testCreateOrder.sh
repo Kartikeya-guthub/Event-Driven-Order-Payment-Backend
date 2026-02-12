@@ -9,8 +9,8 @@ echo "Creating order..."
 curl -i -X POST "$API_URL/orders" \
   -H "Content-Type: application/json" \
   -d '{
-    "userId": "11111111-1111-1111-1111-111111111111",
-    "amount": 499.99
+    "userId": "11111121-1211-1111-1111-112112112112",
+    "amount": 100
   }'
 
 echo ""

@@ -31,6 +31,7 @@ CREATE TABLE outbox (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+
 -- =========================
 -- PROCESSED EVENTS (idempotency)
 -- =========================
