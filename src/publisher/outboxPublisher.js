@@ -25,11 +25,10 @@ async function start(){
 }
 
 async function publishBatch(){
-    const { rows} = await db.query(`SELECT id,event_id,event_type,payload
+    const { rows} = await db.query(`SELECT id,event_id,event_type,aggregate_type,aggregate_id,payload,created_at
         FROM outbox
         WHERE published = false
-        
-        ORDER BY id
+        ORDER BY created_at
         LIMIT 10`);
 
         if(rows.length === 0){
@@ -42,11 +41,14 @@ async function publishBatch(){
                     topic: "order-events",
                     messages:[
                         {
-                            key: row.event_id,
+                            key: row.aggregate_id,
                             value: JSON.stringify({
                                 eventId: row.event_id,
-                                type: row.event_type,
+                                eventType: row.event_type,
+                                aggregateType: row.aggregate_type,
+                                aggregateId: row.aggregate_id,
                                 payload: row.payload,
+                                createdAt: row.created_at.toISOString()
                             }),
                         }
                     ]
