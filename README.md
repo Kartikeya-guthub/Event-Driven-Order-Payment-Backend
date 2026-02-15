@@ -34,7 +34,7 @@
 
 ## 🎯 Overview
 
-This project implements a **production-grade event-driven order and payment processing system** using the **Transactional Outbox Pattern**, **Event Sourcing**, and **CQRS principles**. It demonstrates how to build resilient, scalable microservices that guarantee exactly-once processing semantics.
+This project implements a **production-grade event-driven order and payment processing system** using the **Transactional Outbox Pattern** and **idempotent consumer patterns**. It demonstrates how to build resilient, scalable microservices that guarantee **exactly-once side-effect semantics** (not exactly-once delivery, which is impossible with Kafka's at-least-once guarantee).
 
 ### Why This Project Matters
 
@@ -253,6 +253,112 @@ WHERE id = ? AND state = 'CREATED';
 5. Worker processes event successfully
 6. Worker commits offset
 ```
+
+---
+
+## ⚠️ Known Limitations & Tradeoffs
+
+This section documents **known limitations** for transparency. Every distributed system has tradeoffs.
+
+### 1️⃣ **Not True Exactly-Once Delivery**
+
+**Claim:** "Exactly-once side-effect semantics"
+
+**Reality:** 
+- Kafka provides **at-least-once delivery** (messages may be duplicated)
+- System achieves **idempotent side-effects** through deduplication
+- This is **not** the same as exactly-once delivery
+
+**Why it matters:** In interviews, distinguish "exactly-once effects" from "exactly-once delivery."
+
+---
+
+### 2️⃣ **Crash Window - Payment May Be Skipped**
+
+**Scenario:**
+```
+1. Worker receives OrderCreated event
+2. Worker inserts into processed_events (marks as handled)
+3. 💥 Worker crashes HERE
+4. Payment service never called
+5. Worker restarts
+6. Event is marked as processed → skipped
+7. Order is stuck in PAYMENT_PENDING state
+```
+
+**Impact:** Small failure window where payment is lost.
+
+**Mitigation strategies (not implemented):**
+- Use database transactions for idempotency check + payment call (requires payment service to support transactions)
+- Implement timeout-based monitoring (alert if order in PAYMENT_PENDING > 5 minutes)
+- Use scheduled job to retry stuck orders
+
+**Current tradeoff:** Simplicity over 100% correctness. Acceptable for demo; would need fix for production.
+
+---
+
+### 3️⃣ **Synchronous Retries Block Partition**
+
+**Current implementation:**
+```javascript
+while (retryCount < MAX_RETRIES) {
+  try {
+    await processPayment(); // Blocks partition
+  } catch (error) {
+    retryCount++;
+    await sleep(1000); // Partition is blocked
+  }
+}
+```
+
+**Impact:** 
+- While retrying, the entire Kafka partition is blocked
+- Other events in the partition cannot be processed
+- Reduces throughput under failure scenarios
+
+**Production alternatives (not implemented):**
+- **Retry topic pattern**: Publish failed events to separate retry topic with delay
+- **Scheduled retry queue**: Use external scheduler (e.g., AWS SQS with visibility timeout)
+- **Async retry workers**: Dedicated workers for retry processing
+
+**Current tradeoff:** Simplicity over scalability. Acceptable for demo; would need optimization for high throughput.
+
+---
+
+### 4️⃣ **Single Worker Type (Composite PK Unused)**
+
+**Database design:**
+```sql
+PRIMARY KEY (event_id, worker_id)
+```
+
+**Intended use:** Allow different worker types to process the same event (e.g., payment-worker, notification-worker).
+
+**Current reality:** Only one worker type (`payment-worker`) exists.
+
+**Why the discrepancy:** Future-proofing. Design allows multiple worker types without schema migration.
+
+**Interview note:** Be honest that this is unused capacity, not active functionality.
+
+---
+
+### 5️⃣ **No Circuit Breaker for Payment Service**
+
+**Current behavior:** If payment service is down, every request retries 3 times.
+
+**Impact:** Cascading failures, wasted resources.
+
+**Production solution:** Implement circuit breaker (e.g., using `opossum` library) to fail fast after detecting service is down.
+
+---
+
+### 6️⃣ **Event Replay Not Implemented**
+
+**What's missing:** Ability to reprocess events from Kafka history for data recovery.
+
+**Why it matters:** If database corruption occurs, cannot rebuild state from events.
+
+**Note:** This system is **event-driven** but **not event-sourced**. The database is the source of truth, not the event log.
 
 ---
 
@@ -742,14 +848,14 @@ This project demonstrates understanding of:
 
 1. **Event-Driven Architecture**
    - Asynchronous message processing
-   - Event sourcing principles
+   - Event-driven communication (not event sourcing)
    - Eventual consistency
 
 2. **Distributed Systems Patterns**
-   - Transactional Outbox
-   - Idempotency
+   - Transactional Outbox Pattern
+   - Idempotent Consumer Pattern
    - Optimistic Locking
-   - Saga Pattern (partial)
+   - Dead-Letter Queue Pattern
 
 3. **Reliability Engineering**
    - Retry mechanisms

@@ -33,7 +33,9 @@ This guide prepares you to explain this project in interviews with **deep techni
 
 This ensures even if Kafka redelivers, the payment is only processed once.
 
-**Proof:** Check my integration test `Test 2: Idempotency`. It verifies that replaying the same event doesn't change the order state or version."
+**Proof:** Check my integration test `Test 2: Idempotency`. It verifies that replaying the same event doesn't change the order state or version.
+
+**Important distinction:** This is **at-least-once delivery** + **idempotent consumer** = **exactly-once side-effects**. It's not true exactly-once delivery, which Kafka doesn't guarantee."
 
 **Why this works:** You **corrected a misconception**, explained the **mechanism**, and referenced **proof**.
 
@@ -150,9 +152,23 @@ I solved this with the **Transactional Outbox Pattern**:
 - Each step is re-entrant (can be retried safely)
 - Kafka offset committed **only after** successful processing
 
-**Failure window:** If crash happens after updating DB but before inserting to `processed_events`, the event **will** be reprocessed. But since state transitions are deterministic (`PAYMENT_PENDING` → `PAID`), it's safe.
+**Failure window - CRITICAL EDGE CASE:** If crash happens **after** inserting to `processed_events` but **before** calling payment service:
+```
+1. Insert to processed_events ✅
+2. 💥 CRASH
+3. Payment never called ❌
+4. On restart: event marked processed → skipped
+5. Order stuck in PAYMENT_PENDING
+```
 
-**Proof:** You can test this by killing the worker process mid-execution."
+**This is a known limitation.** Mitigation would require:
+- Transactional payment calls (not possible with external services)
+- Timeout-based monitoring for stuck orders
+- Scheduled reconciliation job
+
+**Current tradeoff:** Accepted small failure window for simplicity.
+
+**Proof:** You can test crash recovery by killing the worker process mid-execution."
 
 **Why this works:** You walked through a **specific scenario**, explained **recovery**, and showed **deep understanding** of Kafka semantics.
 
@@ -186,13 +202,82 @@ I solved this with the **Transactional Outbox Pattern**:
 
 **Real scenario:** Payment gateway is down. First 3 retries fail, event goes to DLQ. When gateway recovers, ops team can reprocess DLQ events.
 
-**Proof:** `DEMO.md` Part 4 shows how to test this by forcing payment failures."
+**Proof:** `DEMO.md` Part 4 shows how to test this by forcing payment failures.
 
-**Why this works:** You explained **retry strategy**, **failure isolation**, and gave **operational context**.
+**synchronous retry tradeoff:**
+- **Blocks partition** while retrying (reduces throughput)
+- Simpler than async retry mechanisms
+- Acceptable for low-volume demo
+
+**Production alternatives (not implemented):**
+- **Retry topic pattern**: Publish failed events to separate retry topic with delay
+- **Scheduled retry queue**: Use external scheduler (e.g., AWS SQS with visibility timeout)
+- **Async retry workers**: Dedicated workers for retry processing
+
+**Why synchronous retries in this project:**
+- Simpler to implement and understand
+- Demonstrates retry concept without overengineering
+- Acceptable for low-volume scenarios
+
+**Current tradeoff:** Simplicity over scalability. Partition blocking is acceptable for demo; would need async retry queues for high throughput production systems."
+
+**Why this works:** You explained **retry strategy**, **acknowledged limitations**, and showed understanding of **production tradeoffs**.
 
 ---
 
-### 8. "How would you improve this system?"
+### 8. "What are the limitations of your system?"
+
+**❌ Weak Answer:**
+"It doesn't have any major limitations."
+
+**✅ Strong Answer:**
+"I'm glad you asked - every distributed system has tradeoffs. Here are the known limitations:
+
+**1. Crash Window - Payment May Be Lost**
+
+There's a small failure window:
+```
+1. Worker receives event
+2. Inserts into processed_events ✅
+3. 💥 CRASH HERE
+4. Payment never called ❌
+5. On restart: event marked processed → skipped
+6. Order stuck in PAYMENT_PENDING
+```
+
+**Why this happens:** The idempotency check and payment call are **not atomic**.
+
+**Production mitigation:**
+- Timeout-based monitoring (alert if order in PAYMENT_PENDING > 5 minutes)
+- Scheduled reconciliation job to retry stuck orders
+- Could use distributed transactions (Saga pattern), but adds significant complexity
+
+**2. Synchronous Retries Block Partition**
+
+Current implementation blocks the entire Kafka partition while retrying. Production systems would use:
+- Async retry topics with delays
+- Dedicated retry workers
+- Exponential backoff queues
+
+**3. Not True Event Sourcing**
+
+The database is the source of truth, not the event log. If data is corrupted, cannot rebuild from events.
+
+**4. Single Worker Type**
+
+Database schema supports multiple worker types via composite PK `(event_id, worker_id)`, but currently only `payment-worker` exists. This is future-proofing, not active functionality.
+
+**5. No Circuit Breaker**
+
+If payment service is down, every message retries 3 times unnecessarily. Production would use circuit breaker to fail fast.
+
+**Why I'm sharing this:** I wanted to demonstrate understanding of the tradeoffs I made. Simplicity vs. correctness vs. scalability - I chose simplicity for a demo project while documenting the limitations."
+
+**Why this works:** Shows **self-awareness**, **honesty**, **production thinking**, and demonstrates you didn't just copy code without understanding implications.
+
+---
+
+### 9. "How would you improve this system?"
 
 **❌ Weak Answer:**
 "Add more features."
@@ -231,7 +316,7 @@ Each adds complexity. I'd measure first: if DLQ rate < 0.1% and p99 latency < 2s
 
 ---
 
-### 9. "Explain your database schema design choices"
+### 10. "Explain your database schema design choices"
 
 **✅ Strong Answer:**
 
@@ -246,7 +331,7 @@ Each adds complexity. I'd measure first: if DLQ rate < 0.1% and p99 latency < 2s
 - Index on `published_at IS NULL`: Fast query for unpublished events
 
 **`processed_events` table:**
-- Composite PK `(event_id, worker_id)`: Allows same event to be processed by different worker types
+- Composite PK `(event_id, worker_id)`: **Design allows** multiple worker types (e.g., payment-worker, notification-worker), though currently only one type exists
 - Could add `processed_at`: Useful for debugging, data retention policies
 
 **`dead_letter_events` table:**
@@ -261,7 +346,7 @@ Each adds complexity. I'd measure first: if DLQ rate < 0.1% and p99 latency < 2s
 
 ---
 
-### 10. "What did you learn from building this?"
+### 11. "What did you learn from building this?"
 
 **✅ Strong Answer:**
 
