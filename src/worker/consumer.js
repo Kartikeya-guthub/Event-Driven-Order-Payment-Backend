@@ -29,6 +29,7 @@ async function start(){
                   const eventId = event.eventId;
 
   try {
+        // STEP 0: Idempotency check
         try{
           await db.query(`
             INSERT INTO processed_events(event_id, worker_id)
@@ -41,6 +42,8 @@ async function start(){
           }
           throw err;
         }
+
+    // STEP 1: Set to PAYMENT_PENDING
     const result = await db.query(
       `
       UPDATE orders
@@ -59,54 +62,124 @@ async function start(){
     }
 
     const version = result.rows[0].version;
-
     console.log(`Order ${orderId} set to PAYMENT_PENDING`);
 
-   
+    // STEP 2: Process payment
     const paymentResult = await processPayment({
       orderId,
       amount: event.payload.amount,
     });
 
-   
+    // STEP 3: Update state + emit event (atomically)
     if (paymentResult.status === "SUCCESS") {
-      const updateResult = await db.query(
-        `
-        UPDATE orders
-        SET state = 'PAID',
-            version = version + 1,
-            updated_at = now()
-        WHERE id = $1 AND version = $2
-        RETURNING *
-        `,
-        [orderId, version]
-      );
+      const client = await db.getClient();
+      
+      try {
+        await client.query("BEGIN");
 
-      if (updateResult.rowCount === 0) {
-        console.log(`Order ${orderId} version conflict - likely updated by another worker`);
-        return;
+        const updateResult = await client.query(
+          `
+          UPDATE orders
+          SET state = 'PAID',
+              version = version + 1,
+              updated_at = now()
+          WHERE id = $1 AND state = 'PAYMENT_PENDING' AND version = $2
+          RETURNING *
+          `,
+          [orderId, version]
+        );
+
+        if (updateResult.rowCount === 0) {
+          await client.query("ROLLBACK");
+          console.log(`Order ${orderId} state changed by another worker, skipping`);
+          return;
+        }
+
+        // Insert OrderPaid event
+        await client.query(
+          `
+          INSERT INTO outbox (
+            event_id,
+            aggregate_type,
+            aggregate_id,
+            event_type,
+            payload
+          )
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [
+            uuidv4(),
+            "order",
+            orderId,
+            "OrderPaid",
+            JSON.stringify({ orderId }),
+          ]
+        );
+
+        await client.query("COMMIT");
+        console.log(`Order ${orderId} PAID + event emitted`);
+        
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
       }
 
-      console.log(`Order ${orderId} PAID`);
     } else {
-      const updateResult = await db.query(
-        `
-        UPDATE orders
-        SET state = 'FAILED',
-            version = version + 1,
-            updated_at = now()
-        WHERE id = $1 AND version = $2
-        RETURNING *
-        `,
-        [orderId, version]
-      );
+      const client = await db.getClient();
+      
+      try {
+        await client.query("BEGIN");
 
-      if (updateResult.rowCount === 0) {
-        console.log(`Order ${orderId} version conflict - likely updated by another worker`);
-        return;
+        const updateResult = await client.query(
+          `
+          UPDATE orders
+          SET state = 'FAILED',
+              version = version + 1,
+              updated_at = now()
+          WHERE id = $1 AND state = 'PAYMENT_PENDING' AND version = $2
+          RETURNING *
+          `,
+          [orderId, version]
+        );
+
+        if (updateResult.rowCount === 0) {
+          await client.query("ROLLBACK");
+          console.log(`Order ${orderId} state changed by another worker, skipping`);
+          return;
+        }
+
+        // Insert OrderFailed event
+        await client.query(
+          `
+          INSERT INTO outbox (
+            event_id,
+            aggregate_type,
+            aggregate_id,
+            event_type,
+            payload
+          )
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [
+            uuidv4(),
+            "order",
+            orderId,
+            "OrderFailed",
+            JSON.stringify({ orderId }),
+          ]
+        );
+
+        await client.query("COMMIT");
+        console.log(`Order ${orderId} FAILED + event emitted`);
+        
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
       }
-
-      console.log(`Order ${orderId} FAILED`);
     }
   } catch (err) {
     console.error("Processing failed", err);
