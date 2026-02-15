@@ -4,7 +4,6 @@ const db = require("../../db/connection");
 const { processPayment } = require("../mock/paymentService");
 const { v4: uuidv4 } = require('uuid');
 
-const retryMap = new Map(); // eventId -> retry count
 const MAX_RETRIES = 3;
 
 const metrics = {
@@ -36,23 +35,20 @@ async function handleOrderCreated(event) {
   const orderId = event.aggregateId;
   const eventId = event.eventId;
 
-  // STEP 0: Idempotency check
-  try {
-    await db.query(`
-      INSERT INTO processed_events(event_id, worker_id)
-      VALUES ($1, $2)
-    `, [eventId, "payment-worker"]);
-  } catch (err) {
-    if (err.code === "23505") {
-      console.log({
-        service: "payment-worker",
-        type: "DUPLICATE_EVENT",
-        eventId,
-      });
-      metrics.duplicatesSkipped++;
-      return;
-    }
-    throw err;
+  // STEP 0: Check if already processed (idempotency - check only, don't insert yet)
+  const alreadyProcessed = await db.query(`
+    SELECT 1 FROM processed_events
+    WHERE event_id = $1 AND worker_id = $2
+  `, [eventId, "payment-worker"]);
+
+  if (alreadyProcessed.rowCount > 0) {
+    console.log({
+      service: "payment-worker",
+      type: "DUPLICATE_EVENT",
+      eventId,
+    });
+    metrics.duplicatesSkipped++;
+    return;
   }
 
   // STEP 1: Set to PAYMENT_PENDING
@@ -151,6 +147,13 @@ async function handleOrderCreated(event) {
         ]
       );
 
+      // Mark as processed (idempotency)
+      await client.query(`
+        INSERT INTO processed_events(event_id, worker_id)
+        VALUES ($1, $2)
+        ON CONFLICT (event_id, worker_id) DO NOTHING
+      `, [eventId, "payment-worker"]);
+
       await client.query("COMMIT");
       console.log({
         service: "payment-worker",
@@ -215,6 +218,13 @@ async function handleOrderCreated(event) {
         ]
       );
 
+      // Mark as processed (idempotency)
+      await client.query(`
+        INSERT INTO processed_events(event_id, worker_id)
+        VALUES ($1, $2)
+        ON CONFLICT (event_id, worker_id) DO NOTHING
+      `, [eventId, "payment-worker"]);
+
       await client.query("COMMIT");
       console.log({
         service: "payment-worker",
@@ -257,68 +267,84 @@ async function start(){
 
                 if (event.eventType === "OrderCreated") {
                   const eventId = event.eventId;
-                  let retryCount = retryMap.get(eventId) || 0;
+                  let retryCount = 0;
 
-                  try {
-                    // Process the event
-                    await handleOrderCreated(event);
+                  while (retryCount < MAX_RETRIES) {
+                    try {
+                      // Process the event
+                      await handleOrderCreated(event);
 
-                    // Success → cleanup retry tracking
-                    retryMap.delete(eventId);
-
-                  } catch (err) {
-                    retryCount++;
-                    retryMap.set(eventId, retryCount);
-
-                    console.error({
-                      service: "payment-worker",
-                      type: "PROCESSING_ERROR",
-                      eventId,
-                      retryCount,
-                      error: err.message,
-                    });
-
-                    metrics.retriedEvents++;
-
-                    if (retryCount >= MAX_RETRIES) {
-                      console.error({
-                        service: "payment-worker",
-                        type: "DLQ_EVENT",
-                        eventId,
-                        reason: err.message,
-                        retriesAttempted: retryCount,
-                      });
-
-                      // Move to dead-letter queue
-                      await db.query(`
-                        INSERT INTO dead_letter_events (
-                          event_id,
-                          event_type,
-                          aggregate_id,
-                          payload,
-                          reason
-                        )
-                        VALUES ($1, $2, $3, $4, $5)
-                        ON CONFLICT (event_id) DO NOTHING
-                      `, [
-                        event.eventId,
-                        event.eventType,
-                        event.aggregateId,
-                        JSON.stringify(event.payload),
-                        err.message,
-                      ]);
-
-                      metrics.dlqEvents++;
-                      retryMap.delete(eventId);
-                    } else {
-                      // Let Kafka retry (don't throw to avoid consumer crash)
+                      // Success → break out of retry loop
                       console.log({
                         service: "payment-worker",
-                        type: "RETRY_SCHEDULED",
+                        type: "PROCESSING_SUCCESS",
+                        eventId,
+                        retriesUsed: retryCount,
+                      });
+                      break;
+
+                    } catch (err) {
+                      retryCount++;
+
+                      console.error({
+                        service: "payment-worker",
+                        type: "PROCESSING_ERROR",
                         eventId,
                         retryCount,
-                        maxRetries: MAX_RETRIES,
+                        error: err.message,
                       });
+
+                      metrics.retriedEvents++;
+
+                      if (retryCount >= MAX_RETRIES) {
+                        console.error({
+                          service: "payment-worker",
+                          type: "DLQ_EVENT",
+                          eventId,
+                          reason: err.message,
+                          retriesAttempted: retryCount,
+                        });
+
+                        // Move to dead-letter queue
+                        try {
+                          await db.query(`
+                            INSERT INTO dead_letter_events (
+                              event_id,
+                              event_type,
+                              aggregate_id,
+                              payload,
+                              reason
+                            )
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (event_id) DO NOTHING
+                          `, [
+                            event.eventId,
+                            event.eventType,
+                            event.aggregateId,
+                            JSON.stringify(event.payload),
+                            err.message,
+                          ]);
+
+                          metrics.dlqEvents++;
+                        } catch (dlqErr) {
+                          console.error({
+                            service: "payment-worker",
+                            type: "DLQ_INSERT_ERROR",
+                            eventId,
+                            error: dlqErr.message,
+                          });
+                        }
+                      } else {
+                        // Wait before retrying
+                        console.log({
+                          service: "payment-worker",
+                          type: "RETRY_SCHEDULED",
+                          eventId,
+                          retryCount,
+                          maxRetries: MAX_RETRIES,
+                        });
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                      }
                     }
                   }
                 } else {
