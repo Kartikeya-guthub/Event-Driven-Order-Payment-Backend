@@ -31,7 +31,7 @@ async function start(){
   try {
         try{
           await db.query(`
-            INSERT INTO processed_events(event_id,worker_id)
+            INSERT INTO processed_events(event_id, worker_id)
             VALUES ($1, $2)
             `,[eventId, "payment-worker"])
         }catch(err){
@@ -58,6 +58,8 @@ async function start(){
       return;
     }
 
+    const version = result.rows[0].version;
+
     console.log(`Order ${orderId} set to PAYMENT_PENDING`);
 
    
@@ -68,29 +70,41 @@ async function start(){
 
    
     if (paymentResult.status === "SUCCESS") {
-      await db.query(
+      const updateResult = await db.query(
         `
         UPDATE orders
         SET state = 'PAID',
             version = version + 1,
             updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND version = $2
+        RETURNING *
         `,
-        [orderId]
+        [orderId, version]
       );
+
+      if (updateResult.rowCount === 0) {
+        console.log(`Order ${orderId} version conflict - likely updated by another worker`);
+        return;
+      }
 
       console.log(`Order ${orderId} PAID`);
     } else {
-      await db.query(
+      const updateResult = await db.query(
         `
         UPDATE orders
         SET state = 'FAILED',
             version = version + 1,
             updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND version = $2
+        RETURNING *
         `,
-        [orderId]
+        [orderId, version]
       );
+
+      if (updateResult.rowCount === 0) {
+        console.log(`Order ${orderId} version conflict - likely updated by another worker`);
+        return;
+      }
 
       console.log(`Order ${orderId} FAILED`);
     }
