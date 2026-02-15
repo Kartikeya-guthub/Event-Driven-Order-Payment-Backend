@@ -4,6 +4,20 @@ const db = require("../../db/connection");
 const { processPayment } = require("../mock/paymentService");
 const { v4: uuidv4 } = require('uuid');
 
+const metrics = {
+  eventsProcessed: 0,
+  duplicatesSkipped: 0,
+  paymentsSuccess: 0,
+  paymentsFailed: 0,
+};
+
+setInterval(() => {
+  console.log({
+    service: "payment-worker",
+    type: "METRICS",
+    ...metrics,
+  });
+}, 10000);
 
 const kafka = new Kafka({
     clientId: "payment-worker",
@@ -15,7 +29,11 @@ const consumer = kafka.consumer({groupId:"payment-group"})
 async function start(){
     await consumer.connect();
     await consumer.subscribe({ topic: "order-events", fromBeginning: true });
-    console.log("Payment Worker connected to Kafka and subscribed to order-events");
+    console.log({
+        service: "payment-worker",
+        type: "STARTUP",
+        message: "Payment Worker connected to Kafka and subscribed to order-events",
+    });
 
     await consumer.run({
         eachMessage: async({ topic, partition, message })=>{
@@ -23,7 +41,14 @@ async function start(){
                 const value = message.value.toString();
                 const event = JSON.parse(value);
 
-                console.log("Received event:", event);
+                console.log({
+                    service: "payment-worker",
+                    type: "EVENT_RECEIVED",
+                    eventId: event.eventId,
+                    eventType: event.eventType,
+                });
+
+                metrics.eventsProcessed++;
                 if (event.eventType === "OrderCreated") {
                   const orderId = event.aggregateId;
                   const eventId = event.eventId;
@@ -37,7 +62,12 @@ async function start(){
             `,[eventId, "payment-worker"])
         }catch(err){
           if(err.code === "23505"){
-            console.log(`Event ${eventId} already processed, skipping`);
+            console.log({
+              service: "payment-worker",
+              type: "DUPLICATE_EVENT",
+              eventId,
+            });
+            metrics.duplicatesSkipped++;
             return;
           }
           throw err;
@@ -57,12 +87,22 @@ async function start(){
     );
 
     if (result.rowCount === 0) {
-      console.log(`Order ${orderId} already processed or invalid state`);
+      console.log({
+        service: "payment-worker",
+        type: "STATE_CHANGE",
+        orderId,
+        newState: "ALREADY_PROCESSED_OR_INVALID_STATE",
+      });
       return;
     }
 
     const version = result.rows[0].version;
-    console.log(`Order ${orderId} set to PAYMENT_PENDING`);
+    console.log({
+      service: "payment-worker",
+      type: "STATE_CHANGE",
+      orderId,
+      newState: "PAYMENT_PENDING",
+    });
 
     // STEP 2: Process payment
     const paymentResult = await processPayment({
@@ -70,8 +110,16 @@ async function start(){
       amount: event.payload.amount,
     });
 
+    console.log({
+      service: "payment-worker",
+      type: "PAYMENT_RESULT",
+      orderId,
+      status: paymentResult.status,
+    });
+
     // STEP 3: Update state + emit event (atomically)
     if (paymentResult.status === "SUCCESS") {
+      metrics.paymentsSuccess++;
       const client = await db.getClient();
       
       try {
@@ -91,7 +139,12 @@ async function start(){
 
         if (updateResult.rowCount === 0) {
           await client.query("ROLLBACK");
-          console.log(`Order ${orderId} state changed by another worker, skipping`);
+          console.log({
+            service: "payment-worker",
+            type: "STATE_CHANGE",
+            orderId,
+            newState: "STATE_CHANGED_BY_ANOTHER_WORKER",
+          });
           return;
         }
 
@@ -117,7 +170,12 @@ async function start(){
         );
 
         await client.query("COMMIT");
-        console.log(`Order ${orderId} PAID + event emitted`);
+        console.log({
+          service: "payment-worker",
+          type: "STATE_CHANGE",
+          orderId,
+          newState: "PAID",
+        });
         
       } catch (err) {
         await client.query("ROLLBACK");
@@ -127,6 +185,7 @@ async function start(){
       }
 
     } else {
+      metrics.paymentsFailed++;
       const client = await db.getClient();
       
       try {
@@ -146,7 +205,12 @@ async function start(){
 
         if (updateResult.rowCount === 0) {
           await client.query("ROLLBACK");
-          console.log(`Order ${orderId} state changed by another worker, skipping`);
+          console.log({
+            service: "payment-worker",
+            type: "STATE_CHANGE",
+            orderId,
+            newState: "STATE_CHANGED_BY_ANOTHER_WORKER",
+          });
           return;
         }
 
@@ -172,7 +236,12 @@ async function start(){
         );
 
         await client.query("COMMIT");
-        console.log(`Order ${orderId} FAILED + event emitted`);
+        console.log({
+          service: "payment-worker",
+          type: "STATE_CHANGE",
+          orderId,
+          newState: "FAILED",
+        });
         
       } catch (err) {
         await client.query("ROLLBACK");
@@ -182,20 +251,37 @@ async function start(){
       }
     }
   } catch (err) {
-    console.error("Processing failed", err);
+    console.error({
+      service: "payment-worker",
+      type: "ERROR",
+      orderId,
+      error: err.message,
+    });
   }
 }else {
-  console.log(`Skipping event type ${event.eventType}`);
+  console.log({
+    service: "payment-worker",
+    type: "SKIPPED_EVENT_TYPE",
+    eventType: event.eventType,
+  });
 }
 
             }catch(err){
-                console.error("Error processing message:", err);
+                console.error({
+                  service: "payment-worker",
+                  type: "ERROR",
+                  error: err.message,
+                });
             }
         }
     })
 }
 
 start().catch(err=>{
-    console.error("Error starting consumer:", err);
+    console.error({
+      service: "payment-worker",
+      type: "ERROR",
+      error: err.message,
+    });
     process.exit(1);
 });
