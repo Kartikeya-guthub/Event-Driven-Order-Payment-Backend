@@ -645,6 +645,64 @@ psql ... -c "SELECT COUNT(*) FROM dead_letter_events;"
 # ✅ PASS: Failed events moved to DLQ after retries
 ```
 
+### Automated Integration Tests
+
+Run the complete integration test suite:
+
+```bash
+# Ensure all services are running first:
+# - docker-compose up -d
+# - npm run dev (Terminal 1)
+# - node src/publisher/outboxPublisher.js (Terminal 2)
+# - node src/worker/consumer.js (Terminal 3)
+
+# Run integration tests
+npm run test:integration
+```
+
+**What the tests verify:**
+
+| Test | Verification |
+|------|--------------|
+| **Complete Order Flow** | Order creation → Event publishing → Payment processing → State updates |
+| **Idempotency** | Duplicate events are detected and skipped |
+| **Transactional Outbox** | Order and outbox event saved atomically |
+| **Optimistic Locking** | Version-based concurrency control prevents conflicts |
+| **State Machine** | Valid state transitions enforced |
+
+**Example Output:**
+```
+🧪 Starting Integration Tests
+
+📋 Test 1: Complete Order Flow (Happy Path)
+  ✓ Order created: 85136923-023b-4304-a9c7-dcb4dde2eab4
+  ✓ Order persisted with state: CREATED
+  ✓ Outbox event created: OrderCreated
+  ✓ Event published at: 2026-02-15T14:23:45.123Z
+  ✓ Payment processed: PAID
+  ✓ Event marked as processed in processed_events table
+  ✓ Version correctly incremented to: 3
+✅ Test 1 PASSED
+
+📋 Test 2: Idempotency - Duplicate Event Handling
+  ✓ Order created: a1b2c3d4-e5f6-4789-a012-3456789abcdef
+  ✓ Initial state: PAID, version: 3
+  ✓ Event already in processed_events table
+  ✓ Order state unchanged (version: 3)
+✅ Test 2 PASSED
+
+...
+
+═══════════════════════════════════════════════════
+📊 Test Summary
+═══════════════════════════════════════════════════
+✅ Passed: 5/5
+❌ Failed: 0/5
+═══════════════════════════════════════════════════
+
+🎉 All integration tests passed!
+```
+
 ---
 
 ## 📁 Project Structure
@@ -666,9 +724,13 @@ event-driven-order-payment/
 │   │   └── orders.js           # Order routes
 │   └── worker/
 │       └── consumer.js         # Kafka consumer (payment worker)
+├── test/
+│   └── integration/
+│       └── orderFlow.test.js   # Integration tests
 ├── docker-compose.yml          # Docker services configuration
 ├── package.json
 ├── .env                        # Environment variables
+├── DEMO.md                     # Step-by-step demo guide
 └── README.md
 ```
 
