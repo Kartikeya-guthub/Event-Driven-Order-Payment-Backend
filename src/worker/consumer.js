@@ -2,7 +2,7 @@ const { Kafka } = require("kafkajs");
 require("dotenv").config();
 const db = require("../../db/connection");
 const { processPayment } = require("../mock/paymentService");
-
+const { v4: uuidv4 } = require('uuid');
 
 
 const kafka = new Kafka({
@@ -25,10 +25,22 @@ async function start(){
 
                 console.log("Received event:", event);
                 if (event.eventType === "OrderCreated") {
-  const orderId = event.aggregateId;
+                  const orderId = event.aggregateId;
+                  const eventId = event.eventId;
 
   try {
-    // STEP 1: mark as PAYMENT_PENDING
+        try{
+          await db.query(`
+            INSERT INTO processed_events(event_id,worker_id)
+            VALUES ($1, $2)
+            `,[eventId, "payment-worker"])
+        }catch(err){
+          if(err.code === "23505"){
+            console.log(`Event ${eventId} already processed, skipping`);
+            return;
+          }
+          throw err;
+        }
     const result = await db.query(
       `
       UPDATE orders
@@ -48,13 +60,13 @@ async function start(){
 
     console.log(`Order ${orderId} set to PAYMENT_PENDING`);
 
-    // STEP 2: call payment (outside DB)
+   
     const paymentResult = await processPayment({
       orderId,
       amount: event.payload.amount,
     });
 
-    // STEP 3: update final state
+   
     if (paymentResult.status === "SUCCESS") {
       await db.query(
         `
