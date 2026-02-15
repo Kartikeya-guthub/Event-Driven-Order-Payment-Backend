@@ -150,23 +150,56 @@ I solved this with the **Transactional Outbox Pattern**:
 - Idempotency check happens **before** any processing
 - State is stored in DB (durable), not in-memory
 - Each step is re-entrant (can be retried safely)
-- Kafka offset committed **only after** successful processing
+- Kafka offset auto-committed **after** successful message handling
 
-**Failure window - CRITICAL EDGE CASE:** If crash happens **after** inserting to `processed_events` but **before** calling payment service:
+**Failure windows - CRITICAL EDGE CASES:**
+
+There are **three distinct crash windows**:
+
+**Window A: Crash Before State Update** (Safe)
 ```
-1. Insert to processed_events ✅
-2. 💥 CRASH
-3. Payment never called ❌
-4. On restart: event marked processed → skipped
-5. Order stuck in PAYMENT_PENDING
+1. Idempotency check passes
+2. 💥 CRASH before UPDATE PAYMENT_PENDING
+3. Event NOT in processed_events
+4. On restart: Reprocessed successfully ✅
 ```
 
-**This is a known limitation.** Mitigation would require:
-- Transactional payment calls (not possible with external services)
-- Timeout-based monitoring for stuck orders
-- Scheduled reconciliation job
+**Window B: Crash After State Update, Before Payment** (Order Stuck)
+```
+1. Update order to PAYMENT_PENDING ✅
+2. 💥 CRASH before payment call
+3. Event NOT in processed_events
+4. On restart: Idempotency check passes, but order already PAYMENT_PENDING
+5. Order stuck in PAYMENT_PENDING ❌
+```
 
-**Current tradeoff:** Accepted small failure window for simplicity.
+**Window C: Crash After Payment, Before DB Commit** (MOST DANGEROUS)
+```
+1. Payment service called → Customer charged $100 ✅
+2. 💥 CRASH before transaction COMMIT
+3. Transaction rolls back:
+   - Order NOT marked PAID
+   - processed_events NOT inserted
+4. On restart: Event reprocessed
+5. If payment lacks idempotency → Customer charged TWICE ❌❌
+```
+
+**Mitigation strategies:**
+- **Window A**: No action needed (safe)
+- **Window B**: Timeout monitoring + reconciliation job
+- **Window C**: **Idempotency keys to payment service** (CRITICAL)
+
+**Production implementation:**
+```javascript
+await stripeAPI.charges.create({
+  amount: event.payload.amount,
+  idempotency_key: event.eventId,  // Prevents duplicate charges
+});
+```
+
+**Current limitation:** Mock payment service doesn't implement idempotency keys. Real payment services (Stripe, Razorpay) all support this.
+
+**This is the difference between internal consistency (database) and external consistency (payment service).**
 
 **Proof:** You can test crash recovery by killing the worker process mid-execution."
 
@@ -233,17 +266,25 @@ I solved this with the **Transactional Outbox Pattern**:
 **✅ Strong Answer:**
 "I'm glad you asked - every distributed system has tradeoffs. Here are the known limitations:
 
-**1. Crash Window - Payment May Be Lost**
+**1. Three Crash Windows - Including Dangerous Payment Double-Charge**
 
-There's a small failure window:
+There are three failure scenarios:
+
+**Window A**: Crash before state update → Event reprocessed (safe)
+
+**Window B**: Crash after PAYMENT_PENDING update but before payment call → Order stuck
+
+**Window C** (MOST DANGEROUS): Crash after payment succeeds but before transaction COMMIT:
 ```
-1. Worker receives event
-2. Inserts into processed_events ✅
-3. 💥 CRASH HERE
-4. Payment never called ❌
-5. On restart: event marked processed → skipped
-6. Order stuck in PAYMENT_PENDING
+1. Payment charged ✅ ($100 from customer)
+2. 💥 CRASH before DB commit
+3. Order NOT marked PAID
+4. processed_events NOT inserted
+5. On restart: Reprocessed
+6. Without payment idempotency → Charged TWICE ❌ ($200 total)
 ```
+
+**Why Window C is critical:** External side-effect (payment) completed, but internal state (database) rolled back. This is the classic distributed transaction problem.
 
 **Why this happens:** The idempotency check and payment call are **not atomic**.
 
@@ -271,6 +312,32 @@ Database schema supports multiple worker types via composite PK `(event_id, work
 
 If payment service is down, every message retries 3 times unnecessarily. Production would use circuit breaker to fail fast.
 
+**6. External Payment Idempotency Not Implemented**
+
+The system protects **internal state** (database) but not **external side-effects** (payment charges).
+
+**Problem:**
+```javascript
+// Current mock - no idempotency key
+await processPayment({ orderId, amount });
+
+// Production - should include idempotency key
+await stripeAPI.charges.create({
+  amount: amount,
+  idempotency_key: event.eventId,  // Prevents duplicate charges on replay
+});
+```
+
+Without idempotency keys, Window C crashes can cause duplicate charges.
+
+**7. Publisher May Publish Events Twice**
+
+If publisher crashes after publishing to Kafka but before updating `published_at`, the event is republished on restart. This is handled by consumer idempotency, but worth noting.
+
+**8. Kafka Auto-Commit Used (Not Manual Commit)**
+
+Using default auto-commit (every 5 seconds) instead of manual `commitOffsets()` after transaction COMMIT. This increases redelivery window but simplifies code.
+
 **Why I'm sharing this:** I wanted to demonstrate understanding of the tradeoffs I made. Simplicity vs. correctness vs. scalability - I chose simplicity for a demo project while documenting the limitations."
 
 **Why this works:** Shows **self-awareness**, **honesty**, **production thinking**, and demonstrates you didn't just copy code without understanding implications.
@@ -292,9 +359,11 @@ If payment service is down, every message retries 3 times unnecessarily. Product
 - Implement **alerting** on DLQ growth, processing lag
 
 **2. Reliability (Short-term)**
+- **CRITICAL**: Add **idempotency keys** to payment service calls (prevents duplicate charges)
 - Add **circuit breakers** for payment service calls
-- Implement **exponential backoff** with jitter in retries
-- Add **rate limiting** to prevent payment gateway throttling
+- Switch to **manual offset commit** (`autoCommit: false`) for finer control
+- Implement **timeout monitoring** for stuck orders (alert if PAYMENT_PENDING > 5 min)
+- Add **exponential backoff** in retries (currently fixed 1 second delay)
 - Create **health check endpoints** for k8s liveness/readiness
 
 **3. Scalability (Medium-term)**
@@ -316,7 +385,60 @@ Each adds complexity. I'd measure first: if DLQ rate < 0.1% and p99 latency < 2s
 
 ---
 
-### 10. "Explain your database schema design choices"
+### 10. "When do you commit Kafka offsets?"
+
+**❌ Weak Answer:**
+"After processing the message."
+
+**✅ Strong Answer:**
+"Currently using **KafkaJS default auto-commit** behavior:
+
+**How it works:**
+- Auto-commits offsets every **5 seconds** (default interval)
+- Commits **after** message handler returns successfully
+- If handler throws exception, offset is **not committed**
+- Kafka redelivers message on restart
+
+**Commit flow:**
+```
+1. Receive message (offset 100)
+2. Process message (update DB, insert processed_events)
+3. Handler returns success ✅
+4. KafkaJS auto-commits offset 101 (async, within 5 seconds)
+5. If crash before auto-commit → Kafka redelivers from offset 100
+```
+
+**Why auto-commit works here:**
+- Idempotency table (`processed_events`) handles redelivery
+- Safe to reprocess messages
+- Simpler than manual commit
+
+**Production improvement:**
+```javascript
+// Disable auto-commit
+const consumer = kafka.consumer({
+  groupId: 'payment-group',
+  autoCommit: false,
+});
+
+// Manual commit after DB transaction
+await client.query('COMMIT');  // Database transaction
+await consumer.commitOffsets([  // Kafka offset
+  { topic, partition, offset: (parseInt(message.offset) + 1).toString() }
+]);
+```
+
+**Trade-off:**
+- **Auto-commit**: Simpler, but 5-second redelivery window on crash
+- **Manual commit**: More precise, but adds complexity and potential for bugs (forgetting to commit)
+
+**Current choice:** Auto-commit for simplicity. Idempotency handles redelivery safely."
+
+**Why this works:** You explained **mechanics**, showed **understanding of timing**, and discussed **trade-offs**.
+
+---
+
+### 11. "Explain your database schema design choices"
 
 **✅ Strong Answer:**
 
@@ -346,7 +468,7 @@ Each adds complexity. I'd measure first: if DLQ rate < 0.1% and p99 latency < 2s
 
 ---
 
-### 11. "What did you learn from building this?"
+### 12. "What did you learn from building this?"
 
 **✅ Strong Answer:**
 

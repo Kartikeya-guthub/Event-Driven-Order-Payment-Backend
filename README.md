@@ -57,7 +57,7 @@ Most developers build CRUD APIs. This project showcases:
 | 🔄 **Transactional Outbox** | Atomic DB writes + event publishing | ✅ Complete |
 | 🎯 **Idempotency** | Duplicate event detection & prevention | ✅ Complete |
 | 🔒 **Optimistic Locking** | Version-based concurrency control | ✅ Complete |
-| ♻️ **Retry Logic** | Controlled retries with exponential backoff | ✅ Complete |
+| ♻️ **Retry Logic** | Controlled retries (max 3 attempts) | ✅ Complete |
 | 💀 **Dead Letter Queue** | Poison message handling | ✅ Complete |
 | 📊 **Structured Logging** | JSON logs for observability | ✅ Complete |
 | 📈 **Metrics** | Real-time system health monitoring | ✅ Complete |
@@ -273,27 +273,59 @@ This section documents **known limitations** for transparency. Every distributed
 
 ---
 
-### 2️⃣ **Crash Window - Payment May Be Skipped**
+### 2️⃣ **Crash Windows - Multiple Failure Scenarios**
 
-**Scenario:**
+There are **three distinct failure windows** in the current implementation:
+
+#### **Window A: Crash Before State Update**
 ```
 1. Worker receives OrderCreated event
-2. Worker inserts into processed_events (marks as handled)
-3. 💥 Worker crashes HERE
-4. Payment service never called
-5. Worker restarts
-6. Event is marked as processed → skipped
-7. Order is stuck in PAYMENT_PENDING state
+2. Idempotency check passes (event not in processed_events)
+3. 💥 Worker crashes BEFORE updating order to PAYMENT_PENDING
+4. Worker restarts
+5. Event reprocessed (not marked as processed)
+6. ✅ OUTCOME: Event eventually processed (safe)
 ```
+**Impact:** Minimal - event will be reprocessed on restart.
 
-**Impact:** Small failure window where payment is lost.
+#### **Window B: Crash After State Update, Before Payment**
+```
+1. Worker updates order to PAYMENT_PENDING
+2. 💥 Worker crashes BEFORE calling payment service
+3. Worker restarts
+4. Idempotency check fails (not yet in processed_events, but order already PAYMENT_PENDING)
+5. ❌ OUTCOME: Order stuck in PAYMENT_PENDING state
+```
+**Impact:** Order stuck. Requires manual intervention or scheduled reconciliation job.
+
+#### **Window C: Crash After Payment, Before DB Commit (MOST DANGEROUS)**
+```
+1. Worker calls payment service → SUCCESS ✅
+2. Payment charged to customer's card 💳
+3. 💥 Worker crashes BEFORE committing transaction
+4. Transaction rolls back:
+   - Order state NOT updated to PAID
+   - processed_events NOT inserted
+   - OrderPaid event NOT created
+5. Worker restarts
+6. Event reprocessed (not in processed_events)
+7. ❌ OUTCOME: Payment charged but order not marked PAID
+8. On replay: May charge customer TWICE if payment service lacks idempotency
+```
+**Impact:** **CRITICAL** - Customer charged but order shows as failed/pending. Worst-case: duplicate charges.
+
+**Why Window C is dangerous:**
+- External side-effect (payment) completed
+- Internal state (database) not updated
+- Classic distributed transaction problem
 
 **Mitigation strategies (not implemented):**
-- Use database transactions for idempotency check + payment call (requires payment service to support transactions)
-- Implement timeout-based monitoring (alert if order in PAYMENT_PENDING > 5 minutes)
-- Use scheduled job to retry stuck orders
+- **Idempotency keys to payment service**: Send `Idempotency-Key: {eventId}` (see Limitation #7)
+- **Timeout monitoring**: Alert if order in PAYMENT_PENDING > 5 minutes
+- **Scheduled reconciliation**: Compare payment service records with database
+- **Two-phase commit**: Requires payment service to support distributed transactions (rarely available)
 
-**Current tradeoff:** Simplicity over 100% correctness. Acceptable for demo; would need fix for production.
+**Current tradeoff:** Accepted for demo simplicity. Production systems MUST implement payment idempotency keys.
 
 ---
 
@@ -352,7 +384,107 @@ PRIMARY KEY (event_id, worker_id)
 
 ---
 
-### 6️⃣ **Event Replay Not Implemented**
+### 6️⃣ **Publisher May Publish Events Twice**
+
+**Scenario:**
+```
+1. Publisher reads event from outbox table
+2. Publisher successfully publishes to Kafka ✅
+3. 💥 Publisher crashes BEFORE updating published_at timestamp
+4. Publisher restarts
+5. Finds same event (published_at is NULL)
+6. Republishes to Kafka (duplicate)
+```
+
+**Impact:** Same event published to Kafka twice.
+
+**Why this is acceptable:**
+- Consumer has idempotency check (`processed_events` table)
+- Duplicate events are detected and skipped
+- No double processing occurs
+
+**Design insight:** Publisher uses **at-least-once publishing**, consumer provides **exactly-once side-effects** through idempotency. This is the correct distributed systems pattern.
+
+---
+
+### 7️⃣ **External Payment Service Idempotency Not Implemented**
+
+**Problem:** Internal state is protected by idempotency, but external payment calls are not.
+
+**Dangerous scenario (Window C):**
+```
+1. Worker calls payment service → Customer charged $100 ✅
+2. Worker crashes before marking processed
+3. On replay: Worker calls payment service AGAIN
+4. If payment service lacks idempotency → Customer charged $200 ❌
+```
+
+**Production solution:**
+```javascript
+await stripeAPI.charges.create({
+  amount: 10000,
+  currency: 'usd',
+  // Idempotency key prevents duplicate charges
+  idempotency_key: event.eventId,
+});
+```
+
+**Current gap:** Mock payment service doesn't implement idempotency keys.
+
+**Real-world impact:** 
+- Stripe, Razorpay, PayPal all support idempotency keys
+- Without this, replayed events can cause duplicate charges
+- Database is protected, but external systems are not
+
+**This is the difference between internal consistency and external consistency.**
+
+---
+
+### 8️⃣ **Kafka Offset Commit Semantics**
+
+**Current implementation:** Uses KafkaJS **default auto-commit** behavior.
+
+**How it works:**
+- KafkaJS auto-commits offsets every 5 seconds (default)
+- Offset committed **after** message handler completes
+- If crash occurs mid-processing, offset is NOT committed
+- Kafka redelivers message on restart
+
+**Commit timing:**
+```
+1. Receive message
+2. Process message (update DB, insert processed_events, etc.)
+3. Handler returns successfully
+4. KafkaJS auto-commits offset (async, within 5 seconds)
+```
+
+**Why auto-commit works here:**
+- Idempotency table (`processed_events`) handles redelivery
+- Safe to reprocess messages
+
+**Production consideration:**
+- Could use `autoCommit: false` + manual `commitOffsets()` for finer control
+- Would commit immediately after transaction COMMIT
+- Reduces redelivery window from 5 seconds to milliseconds
+
+**Example (not implemented):**
+```javascript
+const consumer = kafka.consumer({
+  groupId: 'payment-group',
+  autoCommit: false,  // Disable auto-commit
+});
+
+// After successful processing:
+await consumer.commitOffsets([
+  { topic, partition, offset: (parseInt(message.offset) + 1).toString() }
+]);
+```
+
+**Current tradeoff:** Auto-commit simplicity vs. manual commit precision.
+
+---
+
+### 9️⃣ **Event Replay Not Implemented**
 
 **What's missing:** Ability to reprocess events from Kafka history for data recovery.
 
